@@ -71,6 +71,8 @@ constexpr absl::string_view queryParamsState = "state";
 constexpr absl::string_view queryParamsRedirectUri = "redirect_uri";
 constexpr absl::string_view queryParamsCodeChallenge = "code_challenge";
 constexpr absl::string_view queryParamsCodeChallengeMethod = "code_challenge_method";
+constexpr absl::string_view queryParamsClientId = "client_id";
+constexpr absl::string_view queryParamsRequestUri = "request_uri";
 
 constexpr absl::string_view stateParamsUrl = "url";
 constexpr absl::string_view stateParamsCsrfToken = "csrf_token";
@@ -1876,8 +1878,44 @@ void OAuth2Filter::finishRefreshAccessTokenFlow() {
 }
 
 void OAuth2Filter::onPushAuthorizationRequestSuccess() {
-  // TODO: send the redirect with client_id and request_uri (redirect work is in progress).
-  sendServiceUnavailableResponse("PAR redirect is not implemented yet");
+  // Take ownership of the pending redirect so that it can be sent at most once. These headers
+  // already carry the CSRF nonce and PKCE code verifier cookies set in redirectToOAuthServer().
+  Http::ResponseHeaderMapPtr response_headers = std::move(pending_par_response_headers_);
+  if (response_headers == nullptr) {
+    // No PAR redirect is pending (PAR is not in use, or the redirect was already sent). Do not
+    // send anything: a second response on this stream would be a bug.
+    ENVOY_TAGGED_STREAM_LOG(error, oauthLogTags(*decoder_callbacks_), *decoder_callbacks_,
+                            "Ignoring PAR success callback without a pending redirect");
+    return;
+  }
+
+  const std::string& request_uri = oauthClient().pushedRequestUri();
+  if (request_uri.empty()) {
+    // Fail closed: never fall back to a redirect that exposes the authorization parameters.
+    sendUnauthorizedResponse("PAR response did not provide a request_uri");
+    return;
+  }
+
+  // RFC 9126 section 4: the authorization request carries only client_id and request_uri. Every
+  // other authorization parameter, including any query parameters configured on the
+  // authorization endpoint, was sent to the PAR endpoint, so the endpoint's query string is
+  // replaced rather than merged.
+  Http::Utility::QueryParamsMulti query_params;
+  query_params.add(queryParamsClientId,
+                   Http::Utility::PercentEncoding::urlEncode(config_->clientId()));
+  query_params.add(queryParamsRequestUri, Http::Utility::PercentEncoding::urlEncode(request_uri));
+
+  // Copy the authorization endpoint URL to replace its query params. Url keeps a view of the new
+  // path, so the string must outlive the toString() call below.
+  auto authorization_endpoint_url = config_->authorizationEndpointUrl();
+  const std::string path_and_query_params = query_params.replaceQueryString(
+      Http::HeaderString(authorization_endpoint_url.pathAndQueryParams()));
+  authorization_endpoint_url.setPathAndQueryParams(path_and_query_params);
+  response_headers->setLocation(authorization_endpoint_url.toString());
+
+  decoder_callbacks_->encodeHeaders(std::move(response_headers), true, REDIRECT_FOR_CREDENTIALS);
+
+  config_->stats().oauth_unauthorized_rq_.inc();
 }
 
 void OAuth2Filter::onPushAuthorizationRequestFailure() {
